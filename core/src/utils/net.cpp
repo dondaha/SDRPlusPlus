@@ -356,7 +356,79 @@ namespace net {
     }
 
     std::shared_ptr<Listener> listen(std::string host, int port) {
-        return listen(Address(host, port));
+        // Initialize if needed
+        init();
+
+        // Use getaddrinfo to support both IPv4 and IPv6
+        struct addrinfo hints, *res;
+        memset(&hints, 0, sizeof(hints));
+        hints.ai_family = AF_UNSPEC;
+        hints.ai_socktype = SOCK_STREAM;
+        hints.ai_protocol = IPPROTO_TCP;
+        hints.ai_flags = AI_PASSIVE;
+
+        char portStr[16];
+        snprintf(portStr, sizeof(portStr), "%d", port);
+
+        if (getaddrinfo(host.c_str(), portStr, &hints, &res) != 0) {
+            throw std::runtime_error("Could not bind socket");
+            return NULL;
+        }
+
+        // Create socket matching the resolved address family
+        SockHandle_t s = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+#ifdef _WIN32
+        if (s == INVALID_SOCKET) {
+#else
+        if (s < 0) {
+#endif
+            freeaddrinfo(res);
+            throw std::runtime_error("Could not bind socket");
+            return NULL;
+        }
+
+        // For IPv6 sockets, disable IPV6_V6ONLY to accept IPv4 connections too (dual-stack).
+        // This is best-effort; some platforms may not support it.
+        if (res->ai_family == AF_INET6) {
+            int off = 0;
+            setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, (char*)&off, sizeof(off));
+        }
+
+#ifndef _WIN32
+        // Allow port reusing if the app was killed or crashed
+        // and the socket is stuck in TIME_WAIT state.
+        // This option has a different meaning on Windows,
+        // so we use it only for non-Windows systems
+        int enable = 1;
+        if (setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(int)) < 0) {
+            closeSocket(s);
+            freeaddrinfo(res);
+            throw std::runtime_error("Could not configure socket");
+            return NULL;
+        }
+#endif
+
+        // Bind socket to the port
+        if (bind(s, res->ai_addr, res->ai_addrlen)) {
+            closeSocket(s);
+            freeaddrinfo(res);
+            throw std::runtime_error("Could not bind socket");
+            return NULL;
+        }
+
+        freeaddrinfo(res);
+
+        // Enable listening
+        if (::listen(s, SOMAXCONN) != 0) {
+            throw std::runtime_error("Could not start listening for connections");
+            return NULL;
+        }
+
+        // Enable nonblocking mode
+        setNonblocking(s);
+
+        // Return listener class
+        return std::make_shared<Listener>(s);
     }
 
     std::shared_ptr<Socket> connect(const Address& addr) {
@@ -381,7 +453,51 @@ namespace net {
     }
 
     std::shared_ptr<Socket> connect(std::string host, int port) {
-        return connect(Address(host, port));
+        // Initialize if needed
+        init();
+
+        // Use getaddrinfo to support both IPv4 and IPv6
+        struct addrinfo hints, *res, *rp;
+        memset(&hints, 0, sizeof(hints));
+        hints.ai_family = AF_UNSPEC;
+        hints.ai_socktype = SOCK_STREAM;
+        hints.ai_protocol = IPPROTO_TCP;
+
+        char portStr[16];
+        snprintf(portStr, sizeof(portStr), "%d", port);
+
+        if (getaddrinfo(host.c_str(), portStr, &hints, &res) != 0) {
+            throw std::runtime_error("Could not connect");
+            return NULL;
+        }
+
+        SockHandle_t s;
+        bool connected = false;
+        for (rp = res; rp != NULL; rp = rp->ai_next) {
+            s = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+#ifdef _WIN32
+            if (s == INVALID_SOCKET) { continue; }
+#else
+            if (s < 0) { continue; }
+#endif
+            if (::connect(s, rp->ai_addr, rp->ai_addrlen) == 0) {
+                connected = true;
+                break;
+            }
+            closeSocket(s);
+        }
+        freeaddrinfo(res);
+
+        if (!connected) {
+            throw std::runtime_error("Could not connect");
+            return NULL;
+        }
+
+        // Enable nonblocking mode
+        setNonblocking(s);
+
+        // Return socket class
+        return std::make_shared<Socket>(s);
     }
 
     std::shared_ptr<Socket> openudp(const Address& raddr, const Address& laddr, bool allowBroadcast) {
